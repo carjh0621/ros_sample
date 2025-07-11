@@ -1,33 +1,24 @@
-# robocar_server_rtsp.py
+# robocar_server_rtsp_pybind.py
 
 import threading
-import subprocess
 import time
 from flask import Flask, jsonify
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
 
+# GObject/GstRTSPServer 바인딩
+import gi
+gi.require_version('Gst', '1.0')
+gi.require_version('GstRtspServer', '1.0')
+from gi.repository import GObject, Gst, GstRtspServer
+
+Gst.init(None)
+
 app = Flask(__name__)
-odom_cache = {"data": None}
+odom_cache = {'data': None}
 lock = threading.Lock()
 
-# 1) RTSP 서버 기동 (gst-rtsp-launch 필요)
-def start_rtsp_server():
-    # 해상도·프레임·비트레이트는 필요에 맞게 조정
-    width, height, framerate, bitrate = 1280, 720, 30, 4000000
-    pipeline = (
-        f"( nvarguscamerasrc ! "
-        f"video/x-raw(memory:NVMM),width={width},height={height},framerate={framerate}/1 ! "
-        f"nvvidconv ! "
-        f"omxh264enc bitrate={bitrate} ! "
-        f"h264parse ! "
-        f"rtph264pay name=pay0 pt=96 )"
-    )
-    # gst-rtsp-launch 가 PATH에 있어야 함
-    subprocess.Popen(['gst-rtsp-launch', pipeline])
-
-# 2) ROS2 오도메트리 구독
 class OdomNode(Node):
     def __init__(self):
         super().__init__('odom_bridge')
@@ -47,27 +38,48 @@ class OdomNode(Node):
             }
         }
         with lock:
-            odom_cache["data"] = data
+            odom_cache['data'] = data
+
+@app.route('/odometry')
+def get_odom():
+    with lock:
+        d = odom_cache['data']
+    if d is None:
+        return jsonify({"error": "no odom"}), 204
+    return jsonify(d), 200
 
 def ros_thread():
     rclpy.init()
     node = OdomNode()
     rclpy.spin(node)
 
-# 3) Flask 오도메트리 라우트
-@app.route('/odometry')
-def get_odom():
-    with lock:
-        d = odom_cache["data"]
-    if d is None:
-        return jsonify({"error": "no odom"}), 204
-    return jsonify(d), 200
+def rtsp_thread():
+    class SensorFactory(GstRtspServer.RTSPMediaFactory):
+        def __init__(self):
+            super().__init__()
+            self.set_shared(True)
+        def do_create_element(self, url):
+            pipeline_str = (
+                "nvarguscamerasrc ! "
+                "video/x-raw(memory:NVMM),width=1280,height=720,framerate=30/1 ! "
+                "nvvidconv ! "
+                "omxh264enc bitrate=4000000 control-rate=1 ! "
+                "h264parse ! rtph264pay name=pay0 pt=96"
+            )
+            return Gst.parse_launch(pipeline_str)
 
-if __name__ == "__main__":
-    # RTSP 서버
-    threading.Thread(target=start_rtsp_server, daemon=True).start()
-    time.sleep(1)  # 서버 기동 대기
-    # ROS 스핀
+    server = GstRtspServer.RTSPServer()
+    mounts = server.get_mount_points()
+    mounts.add_factory("/test", SensorFactory())
+    server.attach(None)
+    loop = GObject.MainLoop()
+    loop.run()
+
+if __name__ == '__main__':
+    # 1) RTSP 서버 (Python 바인딩)
+    threading.Thread(target=rtsp_thread, daemon=True).start()
+    time.sleep(1)
+    # 2) ROS2 오도메트리
     threading.Thread(target=ros_thread, daemon=True).start()
-    # Flask 시작 (영상 스트리밍은 RTSP로 대체)
+    # 3) Flask 오도메트리 서비스
     app.run(host='0.0.0.0', port=8000)
